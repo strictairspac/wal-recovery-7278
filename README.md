@@ -31,11 +31,23 @@ SEED_DEMO=true时启动自动执行种子；自然键查重，不覆盖用户修
 
 crash_after=N表示前N条日志已持久化。最近静止检查点保存全部数据页，检查点后数据页假定均未写回（no-force）。恢复重放日志写入和已abort的撤销，再按LSN倒序撤销未结束事务。独立oracle从检查点账本仅应用已提交事务写入，结果须相同。输出重做/撤销轨迹、事务集合、各阶段账本、SHA256和模型版本。空输入、未知键、事务顺序非法、检查点有活动事务、写锁冲突、崩溃点超限均拒绝。模型不涉及页LSN、CLR、模糊检查点或真实磁盘故障；不是完整ARIES实现。
 
+## 采样站批次幂等写入（页面「04 采样站批次重试」）
+采样站收不到回执就用**同一批次号**重发整批写入，后端在批次号维度串行处理并给出以下保证：
+
+- **并发只认一份提交**：同批次号经 Redis 分布式锁串行（Redis 不可用时退化为进程内锁）；并发重发只有一份首次提交，其余等待后直接拿到结果。
+- **同批同内容重试不重复入账，返回原回执**：以 `batch_no` 唯一约束 + 载荷 SHA256 判定；已提交批次的重试只回首份回执（`replay=true`、`attempts+1`），账本流水不新增。
+- **换了内容就拒绝**：同批次号内容哈希不一致一律 409，旧批与旧账本不受影响。
+- **原批未提交就断电，恢复后可入账**：回执、账本余额、入账流水在**同一数据库事务**提交，同生共死；提交前崩溃只可能留下无流水的 `processing` 残留行，重试接管并完成入账，不丢数据。
+- **跨检查点认出旧批**：批次与回执持久化在 `batch_writes`，进程重启/检查点后旧批次号依旧可查可重放。
+- 页面可录入批次、用同号重试、注入「提交前断电 / 回执丢失」两类故障，并核对断电后的回执、账户余额与入账流水；回执 JSON 下载与原有恢复证据下载并存。
+
+接口：`POST /batches`（提交/重试）、`POST /batches/crash-demo`（故障演练）、`GET /batches`、`GET /batches/{batch_no}`、`GET /batches/{batch_no}/export`、`GET /ledger/accounts`、`GET /ledger/entries`。观察员只读，操作员/管理员可写，写入动作写审计。后端测试见 `backend/tests/`（`pytest`），覆盖幂等、冲突、并发、断电恢复、跨进程重放与权限。
+
 ## 工程与开发
 前端原生HTML/CSS/JS+Nginx1.27；后端Python3.11+FastAPI+SQLAlchemy+PyJWT；PostgreSQL16和Redis7；5服务均healthcheck。持久任务队列在PG，单worker通过Redis锁互斥。20条待执行配额，审计记录写入操作，JWT8小时、PBKDF2随机盐密码。后端路由不含/api，Nginx/api/去前缀代理。
 
 目录frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}与backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}。本地开发安装backend/requirements.txt并设DATABASE_URL/REDIS_URL/JWT_SECRET，再运行uvicorn src.main:app；前端需代理/api。migrations记录初始化结构，暂无在线升级器。
 
-环境COMPOSE_PROJECT_NAME控制命名，FRONTEND_PORT/BACKEND_PORT/DB_PORT为18246/19246/17746，DB_PASSWORD控制演示数据库密码，JWT_SECRET签名密钥，SEED_DEMO控制种子。命名卷db-data/redis-data/artifacts；共享artifacts预留，导出由冻结快照即时生成。Google Fonts需外网，业务离线可运行。默认凭据仅本地演示。
+环境COMPOSE_PROJECT_NAME控制命名，FRONTEND_PORT/BACKEND_PORT/DB_PORT为18246/19246/17746，DB_PASSWORD控制演示数据库密码，JWT_SECRET签名密钥，SEED_DEMO控制种子。命名卷db-data/redis-data/artifacts；共享artifacts预留，导出由冻结快照即时生成。Google Fonts需外网，业务离线可运行。默认凭据仅本地演示。LOCK_BACKEND=local可让批次锁跳过Redis仅用进程内互斥（离线测试用，生产默认走Redis）。
 
 共享枚举roles与任务states定义于backend/src/constants/enums.py、frontend/src/constants/enums.js，状态使用models/entities.py/services/recovery_service.py/worker.py/components/common/status.js；日志操作类型在schemas/log_set.py和pages/logs.js中声明/说明。MIT许可。真实验证见批次test-artifacts/gb-4107/TESTING.md。
